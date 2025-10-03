@@ -72,6 +72,7 @@ def parse_user_date(s: str):
             dt = datetime.strptime(s, f)
             if "%Y" not in f:
                 dt = dt.replace(year=today_year)
+                print(f"date time-------->",dt)
             return dt
         except Exception:
             continue
