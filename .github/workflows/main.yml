@@ -12,7 +12,7 @@ on:
         description: 'End date (YYYY-MM-DD). Optional.'
         required: false
   schedule:
-    # optional: run daily at 20:00 IST (14:30 UTC)
+    # daily at 20:00 IST (14:30 UTC)
     - cron: '30 14 * * *'
 
 permissions:
@@ -22,16 +22,17 @@ jobs:
   run-summary:
     runs-on: ubuntu-latest
     env:
-      # default REPO_OWNER/REPO_NAME can be overridden if needed
-      REPO_OWNER: GM-SDV-UP
-      REPO_NAME: gmhmi_fcc
       # place artifacts into workspace (safe cross-OS)
       OUT_DIR: ${{ github.workspace }}/artifacts
-      # PER_PAGE retains default in script; override if wanted
+      # PER_PAGE can be overridden by workflow env if needed
       PER_PAGE: 100
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          # fetch full history (if you later want to use git data)
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -49,19 +50,29 @@ jobs:
           echo "START_DATE=${{ github.event.inputs.start_date }}" >> $GITHUB_ENV
           echo "END_DATE=${{ github.event.inputs.end_date }}" >> $GITHUB_ENV
 
-      - name: Inject GITHUB_TOKEN (use repository secret)
-        # You must create this secret in repo Settings -> Secrets -> Actions
+      - name: Dump debug env
+        # Helpful: prints key environment values so you can verify the script sees the right repo and token
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "GITHUB_TOKEN is set (length: ${#GITHUB_TOKEN})"
+          echo "GITHUB_REPOSITORY: ${GITHUB_REPOSITORY}"
+          echo "GITHUB_REPOSITORY_OWNER: ${GITHUB_REPOSITORY_OWNER}"
+          echo "GITHUB_REF: ${GITHUB_REF}"
+          echo "Runner workspace: ${GITHUB_WORKSPACE}"
+          echo "OUT_DIR (env): $OUT_DIR"
+          # Print token length only (don't print the token itself)
+          echo "GITHUB_TOKEN length: ${#GITHUB_TOKEN}"
+          # show artifact dir contents (if any)
+          ls -la "$OUT_DIR" || true
 
       - name: Run PR summary script
         env:
+          # Use the Actions-provided token (has repo read permissions in most cases)
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO_OWNER: ${{ env.REPO_OWNER }}
-          REPO_NAME: ${{ env.REPO_NAME }}
+          # Let the script detect repo via GITHUB_REPOSITORY, but still provide OUT_DIR/PER_PAGE
           OUT_DIR: ${{ env.OUT_DIR }}
+          PER_PAGE: ${{ env.PER_PAGE }}
+          # START/END may have been injected into GITHUB_ENV earlier; keep them available
           START_DATE: ${{ env.START_DATE }}
           END_DATE: ${{ env.END_DATE }}
         run: |
@@ -70,19 +81,22 @@ jobs:
       - name: Find output file
         id: findout
         run: |
-          # This greps the log for OUTPUT_FILE or finds recent xlsx in OUT_DIR
-          if OUTPUT=$(grep -m1 "OUTPUT_FILE:" -R || true); then
-            echo "found via log"
-          fi
-          # fallback: find xlsx file
-          FILE=$(ls -t $OUT_DIR/*.xlsx 2>/dev/null | head -n1 || true)
+          # look for the most recent xlsx under OUT_DIR
+          FILE=$(ls -t "$OUT_DIR"/*.xlsx 2>/dev/null | head -n1 || true)
           if [ -n "$FILE" ]; then
             echo "output_file=$FILE" >> $GITHUB_OUTPUT
             echo "Found output: $FILE"
           else
-            echo "output_file=" >> $GITHUB_OUTPUT
-            echo "No output file found in $OUT_DIR"
-            exit 0
+            # fallback: attempt to find any xlsx in workspace (in case OUT_DIR differs)
+            FILE2=$(ls -t $GITHUB_WORKSPACE/*.xlsx 2>/dev/null | head -n1 || true)
+            if [ -n "$FILE2" ]; then
+              echo "output_file=$FILE2" >> $GITHUB_OUTPUT
+              echo "Found output in workspace: $FILE2"
+            else
+              echo "output_file=" >> $GITHUB_OUTPUT
+              echo "No output file found in $OUT_DIR or workspace"
+              exit 0
+            fi
           fi
 
       - name: Upload Excel artifact
