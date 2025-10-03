@@ -2,16 +2,19 @@
 pr_summary_exact_range_with_total.py  (saved as test.py)
 
 - Reads GITHUB_TOKEN from environment (works in GitHub Actions when you add a repo secret).
-- Accepts START_DATE and END_DATE via environment (format: YYYY-MM-DD or any parseable format).
+- Accepts START_DATE and END_DATE via environment (format: YYYY-MM-DD or many parseable formats).
   If not provided and running interactively, will prompt the user.
   If not provided and not interactive (CI), will default to the last 24 hours.
-- Accepts OUT_DIR via environment (defaults to original OUT_DIR variable if not set).
+- Accepts OUT_DIR via environment (defaults to DEFAULT_OUT_DIR if not set).
 - Auto-detects REPO_OWNER/REPO_NAME from GITHUB_REPOSITORY if available.
 - Produces an Excel artifact and prints its path (OUTPUT_FILE: <path>).
+- Includes debug output: saves raw PR JSON and a small CSV summary to OUT_DIR for inspection.
+- Filter behavior: includes PRs where **created_at OR merged_at OR closed_at** falls inside the given date range.
 """
 import os
 import sys
 import time
+import json
 import requests
 import pandas as pd
 from datetime import datetime, date, timedelta
@@ -25,8 +28,7 @@ try:
 except Exception:
     pass
 
-# ---------------- CONFIG (improved, auto-detect in Actions) ----------------
-# GITHUB_TOKEN uses environment first
+# ---------------- CONFIG (auto-detect in Actions if possible) ----------------
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # primary source: environment
 
 # If running inside GitHub Actions, GITHUB_REPOSITORY is provided (owner/repo)
@@ -38,16 +40,12 @@ else:
     REPO_OWNER = os.getenv("REPO_OWNER", "GM-SDV-UP")
     REPO_NAME = os.getenv("REPO_NAME", "gmhmi_fcc")
 
-# Out dir: prefer environment (Actions will set to workspace/artifacts)
 DEFAULT_OUT_DIR = r"D:\Tharun kumar reddy\Github-Data-extract-2025-10"
 OUT_DIR = os.getenv("OUT_DIR", DEFAULT_OUT_DIR)
-
-# PER_PAGE can be overridden via env
 PER_PAGE = int(os.getenv("PER_PAGE", 100))
 # ---------------------------------------------------------------------------
 
 if not GITHUB_TOKEN or GITHUB_TOKEN.strip() == "":
-    # Friendly failure: if running locally, instruct how to provide a token
     msg = (
         "ERROR: GITHUB_TOKEN not found in environment.\n\n"
         "If you are running this script locally, set the environment variable first:\n\n"
@@ -73,7 +71,7 @@ session.headers.update({"Authorization": f"token {GITHUB_TOKEN}", "Accept": "app
 # ----- Utility -----
 def parse_user_date(s: str):
     """Parse many date formats. If year missing, assume current year."""
-    s = s.strip()
+    s = str(s).strip()
     today_year = date.today().year
     fmts = ["%Y-%m-%d", "%b %d %Y", "%b %d", "%d %b %Y", "%d %b",
             "%d-%b-%Y", "%d %B %Y", "%B %d %Y", "%B %d"]
@@ -91,7 +89,7 @@ def parse_user_date(s: str):
         raise ValueError("Could not parse date. Use formats like 2025-09-01 or Sep 1 2025.")
 
 def prompt_date_range():
-    print("Enter start and end dates (only PRs created in this range are considered).")
+    print("Enter start and end dates (PRs with created/merged/closed in this range are considered).")
     s = input("Start date: ").strip()
     e = input("End date:   ").strip()
     start = parse_user_date(s).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -121,7 +119,6 @@ def fetch_all_prs(owner, repo):
     print(f"DEBUG: attempting to access repository via API: {repo_url}")
     meta = session.get(repo_url)
     if meta.status_code != 200:
-        # Print body (safe for logs) and helpful hint
         try:
             body = meta.json()
         except Exception:
@@ -151,25 +148,78 @@ def fetch_all_prs(owner, repo):
         time.sleep(0.12)
     return all_prs
 
+# ----- Debug dump -----
+def dump_prs_for_debug(prs, out_dir):
+    """Save raw JSON and a small CSV summary to OUT_DIR for debugging."""
+    os.makedirs(out_dir, exist_ok=True)
+    raw_path = os.path.join(out_dir, "prs_raw.json")
+    try:
+        with open(raw_path, "w", encoding="utf-8") as f:
+            json.dump(prs, f, ensure_ascii=False, indent=2)
+        print("DEBUG: saved raw PR JSON to", raw_path)
+    except Exception as ex:
+        print("DEBUG: failed saving raw json:", ex)
+
+    # CSV summary
+    rows = []
+    for pr in prs:
+        rows.append({
+            "id": pr.get("id"),
+            "number": pr.get("number"),
+            "title": (pr.get("title") or "")[:120],
+            "user": pr.get("user", {}).get("login"),
+            "created_at": pr.get("created_at"),
+            "merged_at": pr.get("merged_at"),
+            "closed_at": pr.get("closed_at"),
+            "base_ref": pr.get("base", {}).get("ref"),
+            "head_sha": pr.get("head", {}).get("sha")
+        })
+    try:
+        df_dbg = pd.DataFrame(rows)
+        csv_path = os.path.join(out_dir, "prs_debug_summary.csv")
+        df_dbg.to_csv(csv_path, index=False)
+        print("DEBUG: saved PR debug CSV to", csv_path)
+    except Exception as ex:
+        print("DEBUG: failed writing debug CSV:", ex)
+
+    # Print up to 10 PRs for immediate logs
+    print("DEBUG: Sample PRs (up to 10):")
+    for i, r in enumerate(rows[:10], start=1):
+        print(f"  {i}. #{r['number']} {r['title'][:60]} | user={r['user']} | created={r['created_at']} merged={r['merged_at']} closed={r['closed_at']}")
+
 # ----- Summarize -----
 def summarize_exact(prs, start_dt, end_dt, owner, repo):
     """
-    Only PRs with created_at inside [start_dt, end_dt] are considered.
-    For each such PR:
-      - merged_at in range => Merged
-      - closed_at in range => Declined
-      - else => Open
+    Include PRs where ANY of created_at, merged_at, or closed_at falls inside [start_dt, end_dt].
+    Classification for counts:
+      - If merged_at in range => Merged
+      - Else if closed_at in range => Declined
+      - Else => Open
     """
-    created_in_range = []
+    # Select PRs where created OR merged OR closed falls in the date window
+    selected = []
     for pr in prs:
         created_dt = parse_iso_datetime(pr.get("created_at"))
-        if created_dt and start_dt <= created_dt <= end_dt:
-            created_in_range.append((pr, created_dt))
+        merged_dt = parse_iso_datetime(pr.get("merged_at"))
+        closed_dt = parse_iso_datetime(pr.get("closed_at"))
 
+        in_range = False
+        if created_dt and start_dt <= created_dt <= end_dt:
+            in_range = True
+        if merged_dt and start_dt <= merged_dt <= end_dt:
+            in_range = True
+        if closed_dt and start_dt <= closed_dt <= end_dt:
+            in_range = True
+
+        if in_range:
+            # store both pr and parsed created_dt (used for earliest_created)
+            selected.append((pr, created_dt, merged_dt, closed_dt))
+
+    # Group by developer
     by_dev = {}
-    for pr, created_dt in created_in_range:
+    for pr, created_dt, merged_dt, closed_dt in selected:
         login = pr.get("user", {}).get("login", "unknown_user")
-        by_dev.setdefault(login, []).append((pr, created_dt))
+        by_dev.setdefault(login, []).append((pr, created_dt, merged_dt, closed_dt))
 
     rows = []
     for dev, items in by_dev.items():
@@ -179,12 +229,9 @@ def summarize_exact(prs, start_dt, end_dt, owner, repo):
         latest_merged_branch = None
         latest_merged_commit = None
 
-        for pr, created_dt in items:
-            if earliest_created is None or created_dt < earliest_created:
+        for pr, created_dt, merged_dt, closed_dt in items:
+            if created_dt and (earliest_created is None or created_dt < earliest_created):
                 earliest_created = created_dt
-
-            merged_dt = parse_iso_datetime(pr.get("merged_at"))
-            closed_dt = parse_iso_datetime(pr.get("closed_at"))
 
             merged_in_range = merged_dt and start_dt <= merged_dt <= end_dt
             closed_in_range = closed_dt and start_dt <= closed_dt <= end_dt
@@ -198,6 +245,7 @@ def summarize_exact(prs, start_dt, end_dt, owner, repo):
             elif closed_in_range:
                 declined_count += 1
             else:
+                # neither merged nor closed in range -> treat as open (created in range)
                 open_count += 1
 
         total_pr = open_count + merged_count + declined_count
@@ -230,7 +278,6 @@ def save_df(df, repo, start_dt, end_dt, out_dir):
     df = df.copy()
     df.index = range(1, len(df) + 1)
     df.index.name = "Index"
-    # sanitize dates for filename
     s = start_dt.date().isoformat()
     e = end_dt.date().isoformat()
     fname = f"{repo}_summary_{s}_to_{e}.xlsx"
@@ -265,7 +312,21 @@ def main():
     print(f"\nFetching PRs for {REPO_OWNER}/{REPO_NAME} ...")
     prs = fetch_all_prs(REPO_OWNER, REPO_NAME)
     print("Fetched:", len(prs), "PRs")
+
+    # Save raw PR payload and a debug CSV so you can inspect exact API data
+    try:
+        dump_prs_for_debug(prs, OUT_DIR)
+    except Exception as ex:
+        print("DEBUG: dump_prs_for_debug failed:", ex)
+
     df = summarize_exact(prs, start_dt, end_dt, REPO_OWNER, REPO_NAME)
+    print("Rows in summary dataframe:", len(df))
+    if len(df) > 0:
+        print("Sample summary rows:")
+        print(df.head(10).to_string(index=False))
+    else:
+        print("No summary rows matched the date filter (created/merged/closed in range).")
+
     saved_path = save_df(df, REPO_NAME, start_dt, end_dt, OUT_DIR)
     # print path for CI logs
     print("OUTPUT_FILE:", saved_path)
