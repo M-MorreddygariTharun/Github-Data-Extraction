@@ -1,20 +1,19 @@
 """
-pr_summary_exact_range_with_total.py
+pr_summary_exact_range_with_total.py  (saved as test.py)
 
 - Reads GITHUB_TOKEN from environment (works in GitHub Actions when you add a repo secret).
-- Falls back to .env (optional) or interactive prompt for local runs.
-- Prompts user for start/end dates
-- Only considers PRs CREATED inside the date range
-- Counts per developer: Open, Merged, Declined
-- Adds Last_Merge_Branch, Latest_Commit_SHA
-- Adds Total_PR = Open_PR + Merged_PR + Declined_PR
-- Outputs Excel with summary
+- Accepts START_DATE and END_DATE via environment (format: YYYY-MM-DD or any parseable format).
+  If not provided and running interactively, will prompt the user.
+  If not provided and not interactive (CI), will default to the last 24 hours.
+- Accepts OUT_DIR via environment (defaults to original OUT_DIR variable if not set).
+- Produces an Excel artifact.
 """
 import os
+import sys
 import time
 import requests
 import pandas as pd
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -26,15 +25,17 @@ except Exception:
     pass
 
 # ---------------- CONFIG ----------------
-# If you want to hardcode for a quick local test (not recommended), set here:
-# GITHUB_TOKEN = "ghp_...."   # <-- don't commit!
+# GITHUB_TOKEN uses environment first
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # primary source: environment
 
-REPO_OWNER = "GM-SDV-UP"
-REPO_NAME = "gmhmi_fcc"   # repo name
-OUT_DIR = r"D:\Tharun kumar reddy\Github-Data-extract-2025-10"
+REPO_OWNER = os.getenv("REPO_OWNER", "GM-SDV-UP")
+REPO_NAME = os.getenv("REPO_NAME", "gmhmi_fcc")   # repo name
+DEFAULT_OUT_DIR = r"D:\Tharun kumar reddy\Github-Data-extract-2025-10"
 PER_PAGE = 100
 # ----------------------------------------
+
+# Non-interactive override of OUT_DIR (CI will supply this)
+OUT_DIR = os.getenv("OUT_DIR", DEFAULT_OUT_DIR)
 
 if not GITHUB_TOKEN or GITHUB_TOKEN.strip() == "":
     # Friendly failure: if running locally, instruct how to provide a token
@@ -50,7 +51,7 @@ if not GITHUB_TOKEN or GITHUB_TOKEN.strip() == "":
         "Or create a .env file next to this script with:\n"
         "  GITHUB_TOKEN=ghp_xxx\n\n"
         "If you intend to run from GitHub Actions, add your token as a repository secret\n"
-        "and the workflow below will inject it into the environment.\n"
+        "and the workflow will inject it into the environment.\n"
     )
     raise SystemExit(msg)
 
@@ -72,7 +73,6 @@ def parse_user_date(s: str):
             dt = datetime.strptime(s, f)
             if "%Y" not in f:
                 dt = dt.replace(year=today_year)
-                
             return dt
         except Exception:
             continue
@@ -204,19 +204,45 @@ def save_df(df, repo, start_dt, end_dt, out_dir):
     df = df.copy()
     df.index = range(1, len(df) + 1)
     df.index.name = "Index"
-    fname = f"{repo}_summary_{start_dt.date()}_to_{end_dt.date()}.xlsx"
+    # sanitize dates for filename
+    s = start_dt.date().isoformat()
+    e = end_dt.date().isoformat()
+    fname = f"{repo}_summary_{s}_to_{e}.xlsx"
+    os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, fname)
     df.to_excel(path, index=True)
     print("Saved:", path)
+    return path
 
 # ----- Main -----
 def main():
-    start_dt, end_dt = prompt_date_range()
+    # Determine start/end dates
+    env_start = os.getenv("START_DATE")
+    env_end = os.getenv("END_DATE")
+
+    # If env provided, use them
+    if env_start and env_end:
+        start_dt = parse_user_date(env_start).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_dt = parse_user_date(env_end).replace(hour=23, minute=59, second=59, microsecond=999999)
+    else:
+        # If interactive, prompt user (local)
+        if sys.stdin and sys.stdin.isatty():
+            start_dt, end_dt = prompt_date_range()
+        else:
+            # Non-interactive default: last 24 hours
+            now = datetime.utcnow()
+            yesterday = now - timedelta(days=1)
+            start_dt = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_dt = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+            print(f"No START_DATE/END_DATE provided and not interactive. Defaulting to last 24hrs: {start_dt} -> {end_dt}")
+
     print(f"\nFetching PRs for {REPO_OWNER}/{REPO_NAME} ...")
     prs = fetch_all_prs(REPO_OWNER, REPO_NAME)
     print("Fetched:", len(prs), "PRs")
     df = summarize_exact(prs, start_dt, end_dt, REPO_OWNER, REPO_NAME)
-    save_df(df, REPO_NAME, start_dt, end_dt, OUT_DIR)
+    saved_path = save_df(df, REPO_NAME, start_dt, end_dt, OUT_DIR)
+    # print path for CI logs
+    print("OUTPUT_FILE:", saved_path)
 
 if __name__ == "__main__":
     main()
