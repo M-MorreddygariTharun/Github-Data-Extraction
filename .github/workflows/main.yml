@@ -1,0 +1,93 @@
+name: PR Summary Export
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Start date (YYYY-MM-DD). Optional.'
+        required: false
+      end_date:
+        description: 'End date (YYYY-MM-DD). Optional.'
+        required: false
+  schedule:
+    # optional: run daily at 20:00 IST (14:30 UTC)
+    - cron: '30 14 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  run-summary:
+    runs-on: ubuntu-latest
+    env:
+      # default REPO_OWNER/REPO_NAME can be overridden if needed
+      REPO_OWNER: GM-SDV-UP
+      REPO_NAME: gmhmi_fcc
+      # place artifacts into workspace (safe cross-OS)
+      OUT_DIR: ${{ github.workspace }}/artifacts
+      # PER_PAGE retains default in script; override if wanted
+      PER_PAGE: 100
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas python-dotenv
+
+      - name: Provide START/END environment (from manual inputs)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          echo "START_DATE=${{ github.event.inputs.start_date }}" >> $GITHUB_ENV
+          echo "END_DATE=${{ github.event.inputs.end_date }}" >> $GITHUB_ENV
+
+      - name: Inject GITHUB_TOKEN (use repository secret)
+        # You must create this secret in repo Settings -> Secrets -> Actions
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "GITHUB_TOKEN is set (length: ${#GITHUB_TOKEN})"
+
+      - name: Run PR summary script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_OWNER: ${{ env.REPO_OWNER }}
+          REPO_NAME: ${{ env.REPO_NAME }}
+          OUT_DIR: ${{ env.OUT_DIR }}
+          START_DATE: ${{ env.START_DATE }}
+          END_DATE: ${{ env.END_DATE }}
+        run: |
+          python test.py
+
+      - name: Find output file
+        id: findout
+        run: |
+          # This greps the log for OUTPUT_FILE or finds recent xlsx in OUT_DIR
+          if OUTPUT=$(grep -m1 "OUTPUT_FILE:" -R || true); then
+            echo "found via log"
+          fi
+          # fallback: find xlsx file
+          FILE=$(ls -t $OUT_DIR/*.xlsx 2>/dev/null | head -n1 || true)
+          if [ -n "$FILE" ]; then
+            echo "output_file=$FILE" >> $GITHUB_OUTPUT
+            echo "Found output: $FILE"
+          else
+            echo "output_file=" >> $GITHUB_OUTPUT
+            echo "No output file found in $OUT_DIR"
+            exit 0
+          fi
+
+      - name: Upload Excel artifact
+        if: steps.findout.outputs.output_file != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-summary-excel
+          path: ${{ steps.findout.outputs.output_file }}
