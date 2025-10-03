@@ -6,7 +6,8 @@ pr_summary_exact_range_with_total.py  (saved as test.py)
   If not provided and running interactively, will prompt the user.
   If not provided and not interactive (CI), will default to the last 24 hours.
 - Accepts OUT_DIR via environment (defaults to original OUT_DIR variable if not set).
-- Produces an Excel artifact.
+- Auto-detects REPO_OWNER/REPO_NAME from GITHUB_REPOSITORY if available.
+- Produces an Excel artifact and prints its path (OUTPUT_FILE: <path>).
 """
 import os
 import sys
@@ -24,18 +25,26 @@ try:
 except Exception:
     pass
 
-# ---------------- CONFIG ----------------
+# ---------------- CONFIG (improved, auto-detect in Actions) ----------------
 # GITHUB_TOKEN uses environment first
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # primary source: environment
 
-REPO_OWNER = os.getenv("REPO_OWNER", "GM-SDV-UP")
-REPO_NAME = os.getenv("REPO_NAME", "gmhmi_fcc")   # repo name
-DEFAULT_OUT_DIR = r"D:\Tharun kumar reddy\Github-Data-extract-2025-10"
-PER_PAGE = 100
-# ----------------------------------------
+# If running inside GitHub Actions, GITHUB_REPOSITORY is provided (owner/repo)
+_github_repo_env = os.getenv("GITHUB_REPOSITORY", "").strip()
+if _github_repo_env and "/" in _github_repo_env:
+    REPO_OWNER, REPO_NAME = _github_repo_env.split("/", 1)
+else:
+    # fall back to environment variables or hardcoded defaults
+    REPO_OWNER = os.getenv("REPO_OWNER", "GM-SDV-UP")
+    REPO_NAME = os.getenv("REPO_NAME", "gmhmi_fcc")
 
-# Non-interactive override of OUT_DIR (CI will supply this)
+# Out dir: prefer environment (Actions will set to workspace/artifacts)
+DEFAULT_OUT_DIR = r"D:\Tharun kumar reddy\Github-Data-extract-2025-10"
 OUT_DIR = os.getenv("OUT_DIR", DEFAULT_OUT_DIR)
+
+# PER_PAGE can be overridden via env
+PER_PAGE = int(os.getenv("PER_PAGE", 100))
+# ---------------------------------------------------------------------------
 
 if not GITHUB_TOKEN or GITHUB_TOKEN.strip() == "":
     # Friendly failure: if running locally, instruct how to provide a token
@@ -105,12 +114,29 @@ def parse_iso_datetime(iso):
             except Exception:
                 return None
 
-# ----- GitHub fetch -----
+# ----- GitHub fetch (verbose/diagnostic) -----
 def fetch_all_prs(owner, repo):
-    """Fetch all PRs for repo with pagination."""
-    meta = session.get(f"{API_BASE}/repos/{owner}/{repo}")
+    """Fetch all PRs for repo with pagination. Raises verbose errors on failure."""
+    repo_url = f"{API_BASE}/repos/{owner}/{repo}"
+    print(f"DEBUG: attempting to access repository via API: {repo_url}")
+    meta = session.get(repo_url)
     if meta.status_code != 200:
-        raise RuntimeError(f"Cannot access repo {owner}/{repo} (HTTP {meta.status_code}): {meta.text}")
+        # Print body (safe for logs) and helpful hint
+        try:
+            body = meta.json()
+        except Exception:
+            body = meta.text
+        raise RuntimeError(
+            f"Cannot access repo {owner}/{repo} (HTTP {meta.status_code}): {body}\n\n"
+            "Possible causes:\n"
+            " - The repo name or owner is incorrect (check case-sensitive spelling).\n"
+            " - The token lacks access (private repo requires a token with 'repo' scope).\n"
+            " - Running from a forked PR where secrets are not available.\n\n"
+            "Actionable checks:\n"
+            f" - Confirm {repo_url} exists in the browser.\n"
+            " - In Actions, ensure you used secrets.GITHUB_TOKEN or a PAT with repo permissions.\n"
+            " - Print environment vars in the job to confirm REPO_OWNER/REPO_NAME/GITHUB_REPOSITORY.\n"
+        )
 
     all_prs, page = [], 1
     while True:
